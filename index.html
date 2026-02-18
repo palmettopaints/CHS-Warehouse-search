@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PPS Warehouse Locator</title>
+  <style>
+    :root { --bg:#0b0d12; --card:#121622; --muted:#8ea0b7; --text:#e8eef7; --accent:#46b3ff; --border:#223049; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    header { position: sticky; top:0; background: rgba(11,13,18,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); padding: 14px 14px 10px; }
+    .title { font-weight: 800; font-size: 16px; letter-spacing: .2px; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .row { display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap: wrap; }
+    input[type="search"] { flex: 1; min-width: 220px; padding: 12px 12px; border-radius: 12px; border:1px solid var(--border); background: #0f1320; color: var(--text); outline: none; }
+    select, button { padding: 12px 12px; border-radius: 12px; border:1px solid var(--border); background: #0f1320; color: var(--text); }
+    button.primary { background: linear-gradient(180deg, rgba(70,179,255,.18), rgba(70,179,255,.08)); border-color: rgba(70,179,255,.45); }
+    main { padding: 14px; max-width: 980px; margin: 0 auto; }
+    .tabs { display:flex; gap:8px; margin: 10px 0 14px; flex-wrap: wrap; }
+    .tab { padding: 10px 12px; border-radius: 999px; border:1px solid var(--border); color: var(--muted); cursor:pointer; user-select:none; }
+    .tab.active { color: var(--text); border-color: rgba(70,179,255,.55); background: rgba(70,179,255,.08); }
+    .card { background: var(--card); border:1px solid var(--border); border-radius: 16px; padding: 12px; }
+    .list { display:flex; flex-direction: column; gap:10px; }
+    .itemline { display:flex; justify-content: space-between; gap:12px; align-items:flex-start; }
+    .pill { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+            border:1px solid var(--border); border-radius: 999px; padding: 6px 10px; background:#0f1320; white-space: nowrap; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .h { font-weight: 800; }
+    .divider { height:1px; background: var(--border); margin: 10px 0; }
+    .mapWrap { position: relative; overflow: hidden; border-radius: 16px; border:1px solid var(--border); background:#0f1320; }
+    .mapWrap img { width: 100%; display:block; opacity: .95; }
+    .dot { position:absolute; width: 14px; height: 14px; border-radius: 50%; background: var(--accent);
+           box-shadow: 0 0 0 4px rgba(70,179,255,.18); transform: translate(-50%, -50%); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">PPS Warehouse Locator</div>
+    <div id="context" class="sub">Loading CSV…</div>
+
+    <div class="row">
+      <input id="q" type="search" placeholder="Search SKU, description, manufacturer, bin (e.g., A-01-PB)" />
+      <select id="aisleFilter" title="Aisle filter"></select>
+      <button id="clearBtn">Clear</button>
+      <button id="copyLinkBtn" class="primary" title="Copy NFC link for this aisle">Copy aisle link</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-tab="items">Items</div>
+      <div class="tab" data-tab="bins">Bins</div>
+      <div class="tab" data-tab="map">Map</div>
+    </div>
+
+    <div id="panel-items" class="list"></div>
+    <div id="panel-bins" class="list" style="display:none"></div>
+
+    <div id="panel-map" style="display:none">
+      <div class="card">
+        <div class="h">Overhead Map</div>
+        <div class="muted small">Add <span class="pill">warehouse_map.png</span> and optionally coordinates in <span class="pill">warehouse_map.json</span>.</div>
+        <div class="divider"></div>
+
+        <div class="mapWrap">
+          <img id="mapImg" src="warehouse_map.png" alt="Warehouse map"
+               onerror="this.style.display='none'; document.getElementById('mapMissing').style.display='block';" />
+          <div id="mapDot" class="dot" style="display:none"></div>
+          <div id="mapMissing" class="muted small" style="display:none; padding:14px;">
+            Map image not found. Add <span class="pill">warehouse_map.png</span> to enable map view.
+          </div>
+        </div>
+
+        <div class="divider"></div>
+        <div class="muted small">Tip: start with aisle-level pings. Add exact bin dot coords later.</div>
+      </div>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
