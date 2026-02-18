@@ -1,12 +1,18 @@
 // PPS Warehouse Locator (Static GitHub Pages)
-// Reads warehouse_data.csv from same folder.
+// Files expected in the same folder:
+// - index.html
+// - app.js
+// - warehouse_data.csv
+// Optional:
+// - warehouse_map.png
+// - warehouse_map.json  (for bin pin dots)
 
 const state = {
   tab: "items",
   q: "",
   aisle: "ALL",
-  data: null,     // { items:[], bins:Map, aisles:Set, meta:{} }
-  map: null,      // optional warehouse_map.json
+  data: null,      // { items:[], bins:Map, aisles:[], meta:{} }
+  map: null,       // optional
   selectedBin: null,
 };
 
@@ -22,53 +28,87 @@ function setQS(key, val) {
   history.replaceState(null, "", url.toString());
 }
 
-function norm(s) { return (s ?? "").toString().toLowerCase().trim(); }
+function norm(s) {
+  return (s ?? "").toString().toLowerCase().trim();
+}
 
 function escapeHtml(s) {
   return (s ?? "").toString()
-    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function parseBin(bin) {
-  // Expects like A-01-PB (but handles weirdness gracefully)
+  // Expects: A-01-PB, A-01-H, etc.
   const raw = (bin ?? "").toString().trim();
   const parts = raw.split("-");
   const aisle = (parts[0] ?? "").toUpperCase();
-  const bay = (parts[1] ?? "").padStart(2, "0");
-  const zone = (parts.slice(2).join("-") ?? "").toUpperCase();
+  const bayRaw = (parts[1] ?? "").trim();
+  const bay = bayRaw && /^\d+$/.test(bayRaw) ? bayRaw.padStart(2, "0") : bayRaw;
+  const zone = (parts.slice(2).join("-") ?? "").toUpperCase().trim();
   const binNorm = zone ? `${aisle}-${bay}-${zone}` : `${aisle}-${bay}`;
   return { aisle, bay, zone, binNorm };
 }
 
-// Minimal CSV parser that handles quoted commas properly
+// Minimal CSV parser that supports quoted fields containing commas.
+// Also supports CRLF and LF line endings.
 function parseCSV(text) {
   const rows = [];
-  let cur = [];
-  let field = "";
+  let curRow = [];
+  let curField = "";
   let inQuotes = false;
 
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    const next = text[i + 1];
+    const n = text[i + 1];
 
-    if (c === '"' && inQuotes && next === '"') { field += '"'; i++; continue; }
-    if (c === '"') { inQuotes = !inQuotes; continue; }
-
-    if (c === "," && !inQuotes) { cur.push(field); field = ""; continue; }
-    if ((c === "\n" || c === "\r") && !inQuotes) {
-      if (field.length || cur.length) cur.push(field);
-      field = "";
-      if (cur.length) rows.push(cur);
-      cur = [];
-      // handle CRLF
-      if (c === "\r" && next === "\n") i++;
+    // Escaped quote inside quoted field
+    if (c === '"' && inQuotes && n === '"') {
+      curField += '"';
+      i++;
       continue;
     }
 
-    field += c;
+    // Toggle quotes
+    if (c === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    // Field delimiter
+    if (c === "," && !inQuotes) {
+      curRow.push(curField);
+      curField = "";
+      continue;
+    }
+
+    // Row delimiter
+    if ((c === "\n" || c === "\r") && !inQuotes) {
+      // Push last field if row has content
+      if (curField.length || curRow.length) curRow.push(curField);
+      curField = "";
+
+      if (curRow.length) rows.push(curRow);
+      curRow = [];
+
+      // Handle CRLF
+      if (c === "\r" && n === "\n") i++;
+      continue;
+    }
+
+    // Regular character
+    curField += c;
   }
-  if (field.length || cur.length) { cur.push(field); rows.push(cur); }
+
+  // Final row
+  if (curField.length || curRow.length) {
+    curRow.push(curField);
+    rows.push(curRow);
+  }
+
   return rows;
 }
 
@@ -81,18 +121,17 @@ function pickHeaderIndex(headers, candidates) {
   return -1;
 }
 
-async function loadData() {
-  const csvText = await fetch("warehouse_data.csv", { cache: "no-store" }).then(r => {
-    if (!r.ok) throw new Error("Could not load warehouse_data.csv");
-    return r.text();
-  });
+async function loadDataFromCSV() {
+  const resp = await fetch("warehouse_data.csv", { cache: "no-store" });
+  if (!resp.ok) throw new Error("Could not load warehouse_data.csv (is it in the repo root?)");
 
+  const csvText = await resp.text();
   const rows = parseCSV(csvText);
-  if (rows.length < 2) throw new Error("CSV is empty or malformed.");
+  if (rows.length < 2) throw new Error("CSV looks empty or malformed.");
 
   const headers = rows[0];
 
-  // Allow minor header differences
+  // Support a few header naming variants
   const iBin  = pickHeaderIndex(headers, ["Bin Name", "Bin", "BinName"]);
   const iCode = pickHeaderIndex(headers, ["Item Code", "Item", "SKU", "ItemCode"]);
   const iUOM  = pickHeaderIndex(headers, ["UOM", "UoM"]);
@@ -100,66 +139,84 @@ async function loadData() {
   const iMfg  = pickHeaderIndex(headers, ["Manufacturer", "MFG", "Vendor"]);
 
   if (iBin === -1 || iCode === -1 || iDesc === -1) {
-    throw new Error(
-      "Missing required columns. Need at least: Bin Name, Item Code, Inv Description."
-    );
+    throw new Error("Missing required columns. Need at least: Bin Name, Item Code, Inv Description.");
   }
 
-  const items = [];
-  const bins = new Map();   // binNorm -> {bin, aisle, bay, zone, items:[]}
-  const aisles = new Set();
+  const itemsRaw = [];
+  const bins = new Map();      // binNorm -> {bin, aisle, bay, zone, items:[]}
+  const aisleSet = new Set();
 
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
-    const binRaw = (row[iBin] ?? "").trim();
-    const code = (row[iCode] ?? "").trim();
-    const desc = (row[iDesc] ?? "").trim();
-    const uom  = (iUOM !== -1 ? (row[iUOM] ?? "").trim() : "");
-    const mfg  = (iMfg !== -1 ? (row[iMfg] ?? "").trim() : "");
 
-    // Ignore blank item rows (bin separators, empty bins, etc.)
+    const binRaw = (row[iBin] ?? "").toString().trim();
+    const code = (row[iCode] ?? "").toString().trim();
+    const desc = (row[iDesc] ?? "").toString().trim();
+    const uom  = (iUOM !== -1 ? (row[iUOM] ?? "").toString().trim() : "");
+    const mfg  = (iMfg !== -1 ? (row[iMfg] ?? "").toString().trim() : "");
+
+    // Ignore separator/empty rows
     if (!binRaw || !code) continue;
 
     const { aisle, bay, zone, binNorm } = parseBin(binRaw);
     if (!aisle) continue;
 
-    aisles.add(aisle);
+    aisleSet.add(aisle);
 
-    const item = { bin: binNorm, aisle, bay, zone, item_code: code, description: desc, uom, manufacturer: mfg };
-    items.push(item);
+    itemsRaw.push({
+      bin: binNorm,
+      aisle,
+      bay,
+      zone,
+      item_code: code,
+      description: desc,
+      uom,
+      manufacturer: mfg
+    });
 
-    if (!bins.has(binNorm)) bins.set(binNorm, { bin: binNorm, aisle, bay, zone, items: [] });
-    bins.get(binNorm).items.push({ item_code: code, description: desc, uom, manufacturer: mfg });
+    if (!bins.has(binNorm)) {
+      bins.set(binNorm, { bin: binNorm, aisle, bay, zone, items: [] });
+    }
+    bins.get(binNorm).items.push({
+      item_code: code,
+      description: desc,
+      uom,
+      manufacturer: mfg
+    });
   }
 
-  // De-dupe by (bin + item_code + uom)
+  // De-dupe items by (bin + item_code + uom)
   const seen = new Set();
-  const itemsDedup = [];
-  for (const it of items) {
+  const items = [];
+  for (const it of itemsRaw) {
     const key = `${it.bin}||${it.item_code}||${it.uom}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    itemsDedup.push(it);
+    items.push(it);
   }
 
-  // Sort items inside each bin
+  // Sort items inside bins
   for (const b of bins.values()) {
     b.items.sort((a, z) => (a.item_code || "").localeCompare(z.item_code || ""));
   }
 
+  const aisles = Array.from(aisleSet).sort();
+
   const meta = {
-    loaded_items: itemsDedup.length,
+    loaded_items: items.length,
     loaded_bins: bins.size,
-    loaded_aisles: aisles.size,
-    source: "warehouse_data.csv",
+    loaded_aisles: aisles.length,
+    source: "warehouse_data.csv"
   };
 
-  return { items: itemsDedup, bins, aisles: Array.from(aisles).sort(), meta };
+  return { items, bins, aisles, meta };
 }
 
 async function loadMap() {
   try {
-    return await fetch("warehouse_map.json", { cache: "no-store" }).then(r => r.json());
+    const r = await fetch("warehouse_map.json", { cache: "no-store" });
+    if (!r.ok) return null;
+    return await r.json();
   } catch {
     return null;
   }
@@ -177,7 +234,9 @@ function buildAisleOptions() {
   const sel = document.getElementById("aisleFilter");
   sel.innerHTML = "";
   sel.appendChild(new Option("All aisles", "ALL"));
-  for (const a of state.data.aisles) sel.appendChild(new Option(`Aisle ${a}`, a));
+  for (const a of state.data.aisles) {
+    sel.appendChild(new Option(`Aisle ${a}`, a));
+  }
   sel.value = state.aisle;
 }
 
@@ -193,19 +252,30 @@ function aisleOk(it) {
 
 function showMapDotForBin(bin) {
   const dot = document.getElementById("mapDot");
-  if (!state.map || !state.map.coords || !state.map.coords[bin]) { dot.style.display = "none"; return; }
+  if (!dot) return;
+
+  if (!state.map || !state.map.coords || !state.map.coords[bin]) {
+    dot.style.display = "none";
+    return;
+  }
+
   const p = state.map.coords[bin];
   dot.style.left = p.x + "%";
-  dot.style.top = p.y + "%";
+  dot.style.top  = p.y + "%";
   dot.style.display = "block";
 }
 
 function activateTab(tab) {
   state.tab = tab;
-  for (const el of document.querySelectorAll(".tab")) el.classList.toggle("active", el.dataset.tab === tab);
+
+  for (const el of document.querySelectorAll(".tab")) {
+    el.classList.toggle("active", el.dataset.tab === tab);
+  }
+
   document.getElementById("panel-items").style.display = (tab === "items") ? "" : "none";
-  document.getElementById("panel-bins").style.display = (tab === "bins") ? "" : "none";
-  document.getElementById("panel-map").style.display  = (tab === "map")  ? "" : "none";
+  document.getElementById("panel-bins").style.display  = (tab === "bins")  ? "" : "none";
+  document.getElementById("panel-map").style.display   = (tab === "map")   ? "" : "none";
+
   if (tab === "items") renderItems();
   if (tab === "bins") renderBins();
   if (tab === "map" && state.selectedBin) showMapDotForBin(state.selectedBin);
@@ -214,11 +284,16 @@ function activateTab(tab) {
 function renderItems() {
   const panel = document.getElementById("panel-items");
   const q = norm(state.q);
-  const items = state.data.items.filter(it => aisleOk(it) && itemMatches(it, q)).slice(0, 250);
+
+  const items = state.data.items
+    .filter(it => aisleOk(it) && itemMatches(it, q))
+    .slice(0, 250);
 
   panel.innerHTML = "";
+
   if (items.length === 0) {
-    panel.innerHTML = `<div class="card"><div class="h">No matches</div><div class="muted small">Try a different search term.</div></div>`;
+    panel.innerHTML =
+      `<div class="card"><div class="h">No matches</div><div class="muted small">Try a different search term.</div></div>`;
     return;
   }
 
@@ -236,12 +311,14 @@ function renderItems() {
       <div class="divider"></div>
       <button class="primary">Show bin</button>
     `;
+
     card.querySelector("button").addEventListener("click", () => {
       state.selectedBin = it.bin;
       activateTab("bins");
       renderBins();
       showMapDotForBin(it.bin);
     });
+
     panel.appendChild(card);
   }
 
@@ -259,7 +336,14 @@ function renderBins() {
 
   const binsArr = Array.from(state.data.bins.values())
     .filter(b => (state.aisle === "ALL" || b.aisle === state.aisle))
-    .filter(b => !q || norm(b.bin).includes(q) || b.items.some(it => itemMatches({ ...it, bin: b.bin }, q)))
+    .filter(b => {
+      if (!q) return true;
+      if (norm(b.bin).includes(q)) return true;
+      return b.items.some(it => {
+        const itWrap = { ...it, bin: b.bin, manufacturer: it.manufacturer };
+        return itemMatches(itWrap, q);
+      });
+    })
     .sort((a, b) =>
       a.aisle.localeCompare(b.aisle) ||
       (parseInt(a.bay || "9999", 10) - parseInt(b.bay || "9999", 10)) ||
@@ -268,14 +352,29 @@ function renderBins() {
     .slice(0, 150);
 
   panel.innerHTML = "";
+
   if (binsArr.length === 0) {
-    panel.innerHTML = `<div class="card"><div class="h">No bins found</div><div class="muted small">Try a different search term.</div></div>`;
+    panel.innerHTML =
+      `<div class="card"><div class="h">No bins found</div><div class="muted small">Try a different search term.</div></div>`;
     return;
   }
 
   for (const b of binsArr) {
     const card = document.createElement("div");
     card.className = "card";
+
+    const itemsHtml = b.items.slice(0, 60).map(it => `
+      <div style="display:flex; gap:10px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+        <div class="pill" style="flex:0 0 auto;">${escapeHtml(it.item_code)}</div>
+        <div style="flex:1 1 auto;">
+          <div style="font-weight:800; line-height:1.25;">${escapeHtml(it.description || "(no description)")}</div>
+          <div class="muted small" style="margin-top:2px;">
+            ${escapeHtml(it.manufacturer || "—")} • ${escapeHtml(it.uom || "—")}
+          </div>
+        </div>
+      </div>
+    `).join("");
+
     card.innerHTML = `
       <div class="itemline">
         <div>
@@ -284,18 +383,22 @@ function renderBins() {
         </div>
         <button class="primary">Ping map</button>
       </div>
+
       <div class="divider"></div>
+
       <div class="small muted">Items in this bin:</div>
-      <div class="small">
-        ${b.items.slice(0, 25).map(it => `• <span class="pill">${escapeHtml(it.item_code)}</span> ${escapeHtml(it.description)}`).join("<br>")}
-        ${b.items.length > 25 ? `<div class="muted small" style="margin-top:8px;">Showing first 25 items for speed.</div>` : ""}
+      <div class="small" style="margin-top:8px;">
+        ${itemsHtml}
+        ${b.items.length > 60 ? `<div class="muted small" style="margin-top:10px;">Showing first 60 items for speed.</div>` : ""}
       </div>
     `;
+
     card.querySelector("button").addEventListener("click", () => {
       state.selectedBin = b.bin;
       showMapDotForBin(b.bin);
       activateTab("map");
     });
+
     panel.appendChild(card);
   }
 }
@@ -305,7 +408,7 @@ async function init() {
   const aisleParam = (qs("aisle") || "").toUpperCase();
   if (aisleParam) state.aisle = aisleParam;
 
-  state.data = await loadData();
+  state.data = await loadDataFromCSV();
   state.map  = await loadMap();
 
   buildAisleOptions();
@@ -348,7 +451,25 @@ async function init() {
 }
 
 init().catch(err => {
-  document.getElementById("context").textContent = "Error: " + (err?.message || err);
-  document.getElementById("panel-items").innerHTML =
-    `<div class="card"><div class="h">Could not load data</div><div class="muted small">${escapeHtml(err?.message || err)}</div></div>`;
+  const msg = (err?.message || err || "").toString();
+  const context = document.getElementById("context");
+  if (context) context.textContent = "Error: " + msg;
+
+  const panel = document.getElementById("panel-items");
+  if (panel) {
+    panel.innerHTML = `
+      <div class="card">
+        <div class="h">Could not load data</div>
+        <div class="muted small">${escapeHtml(msg)}</div>
+        <div class="divider"></div>
+        <div class="muted small">
+          Checklist:
+          <br>• Ensure <span class="pill">warehouse_data.csv</span> exists in repo root
+          <br>• Filename must match exactly (case sensitive)
+          <br>• CSV must be comma-delimited (Excel: CSV UTF-8)
+          <br>• Required headers: Bin Name, Item Code, Inv Description
+        </div>
+      </div>
+    `;
+  }
 });
